@@ -400,7 +400,7 @@ function salesforce_webforms_webform_component_info() {
     ),
 
     // Conditional comparison type.
-    'conditional_type' => 'select',
+    'conditional_type' => 'sf_picklist',
 
     'file' => 'salesforce_webforms.picklist.inc',
   );
@@ -613,11 +613,20 @@ function salesforce_webforms_webform_submission_insert($node, $sub, $update = FA
           $sql .= "$union$field = '$val'";
           $union = " AND ";
         }
-        $res = _salesforce_webforms_fetch("query?q=" . urlencode($sql), TRUE, $settings['suppress_errors']);
+        $res = _salesforce_webforms_fetch("query?q=" . urlencode($sql), FALSE, $settings['suppress_errors']);
         if (count($res['records']) > 0) {
           $target_id = $res['records'][0]['Id'];
         }
       }
+
+      // Add hook_salesforce_webforms_push_params_alter.
+      $context = array(
+        'map' => $map,
+        'node' => $node,
+        'submission' => $sub,
+        'id' => $target_id,
+      );
+      drupal_alter('salesforce_webforms_save_submission', $fields, $context);
 
       if ($target_id) {
         // Do an update.
@@ -677,11 +686,13 @@ function salesforce_webforms_webform_submission_actions($node, $sub) {
     return $actions;
   }
 
-  $actions['sf'] = array(
-    'title' => t('Resend to Salesforce'),
-    'href' => 'node/' . $node->nid . '/submission/' . $sub->sid . '/sf',
-    'query' => drupal_get_destination(),
-  );
+  if (webform_results_access($node) && user_access('resend salesforce webform results')) {
+    $actions['sf'] = array(
+      'title' => t('Resend to Salesforce'),
+      'href' => 'node/' . $node->nid . '/submission/' . $sub->sid . '/sf',
+      'query' => drupal_get_destination(),
+    );
+  }
 
   return $actions;
 }
@@ -765,6 +776,40 @@ function salesforce_webforms_webform_select_options_info() {
 }
 
 /**
+ * Implements hook_webform_conditional_operator_info().
+ */
+function salesforce_webforms_webform_conditional_operator_info() {
+  return array(
+    'sf_picklist' => array(
+      'equal' => array(
+        'label' => t('is'),
+        'comparison callback' => 'webform_conditional_operator_string_equal',
+        'js comparison callback' => 'conditionalOperatorStringEqual',
+        'form callback' => 'salesforce_webforms_conditional_select',
+      ),
+      'not_equal' => array(
+        'label' => t('is not'),
+        'comparison callback' => 'webform_conditional_operator_string_not_equal',
+        'js comparison callback' => 'conditionalOperatorStringNotEqual',
+        'form callback' => 'salesforce_webforms_conditional_select',
+      ),
+      'empty' => array(
+        'label' => t('is empty'),
+        'comparison callback' => 'webform_conditional_operator_string_empty',
+        'js comparison callback' => 'conditionalOperatorStringEmpty',
+        'form callback' => FALSE,
+      ),
+      'not_empty' => array(
+        'label' => t('is not empty'),
+        'comparison callback' => 'webform_conditional_operator_string_not_empty',
+        'js comparison callback' => 'conditionalOperatorStringNotEmpty',
+        'form callback' => FALSE,
+      ),
+    ),
+  );
+}
+
+/**
  * Callback to build the list of records of the given object.
  *
  * @param array $object
@@ -779,6 +824,38 @@ function salesforce_webforms_object_select_list(array $object) {
   $obj = substr($obj, strlen('salesforce_webforms_'));
   $recs = salesforce_webforms_get_object_records($obj);
   return $recs;
+}
+
+/**
+ * Callback for picklist conditional fields.
+ *
+ * Patterned after webform_conditional_form_select() from webform module.
+ */
+function salesforce_webforms_conditional_select($node) {
+  static $count = 0;
+  $forms = array();
+
+  webform_component_include('sf_picklist');
+  foreach ($node->webform['components'] as $cid => $component) {
+    if (webform_component_property($component['type'], 'conditional_type') == 'sf_picklist') {
+      list($options) = _webform_sf_picklist_options($component);
+      $element = array(
+        '#type' => 'select',
+        '#multiple' => FALSE,
+        '#size' => NULL,
+        '#attributes' => array(),
+        '#id' => NULL,
+        '#name' => 'webform-conditional-sf-picklist-' . $cid . '-' . $count,
+        '#options' => $options,
+        '#parents' => array(),
+      );
+
+      $forms[$cid] = drupal_render($element);
+    }
+  }
+
+  $count++;
+  return $forms;
 }
 
 /**
@@ -892,6 +969,18 @@ function salesforce_webforms_cron_queue_info() {
  */
 function salesforce_webforms_flush_caches() {
   return array('cache_salesforce_webforms');
+}
+
+/**
+ * Implements hook_permission().
+ */
+function salesforce_webforms_permission() {
+  return array(
+    'resend salesforce webform results' => array(
+      'title' => t('Allow resending webform results to Salesforce'),
+      'description' => t('Users with this permission can resend weborm data to Salesforce for any submission which they hav access to.'),
+    ),
+  );
 }
 
 /**
@@ -1062,30 +1151,6 @@ function salesforce_webforms_get_sf_language() {
 }
 
 /**
- * Gets the Salesforce language code for the given Drupal language code.
- *
- * In most instances, these two values are the same. However, for English,
- * Drupal uses 'en' while Salesforce expects 'en_US'.
- *
- * @param string $language
- *   The language to query. If not specified, the language of the current
- *   page is used.
- *
- * @return string
- *   The Salesforce language code corresponding to the Drupal language code.
- */
-function salesforce_webforms_langauge_code($language = NULL) {
-  if (!isset($language)) {
-    $language = $GLOBALS['language']->language;
-  }
-  if ($language == 'en') {
-    $language = 'en_US';
-  }
-
-  return $language;
-}
-
-/**
  * Builds an array of objects of the given type usable as an options array.
  *
  * @param string $object
@@ -1193,10 +1258,20 @@ function salesforce_webforms_get_picklist_options($limit = TRUE) {
 }
 
 /**
- * Returns the current language code as SalesForce expects it.
+ * Gets the Salesforce language code for the given Drupal language code.
  *
- * In most cases, SalesForce and Drupal use the same code. However,
- * for English, Drupal, uses 'en' while SalesForce expects 'en_US'
+ * 1) In most instances, these two values are the same. However, for English,
+ *    Drupal uses 'en' while Salesforce expects 'en_US'.
+ *
+ * 2) RFC 4646 states that country and language code should be seperated by a
+ *    dash "-" while underscore Salesforce expects a "_". 
+ *
+ * @param string $language
+ *   The language to query. If not specified, the language of the current
+ *   page is used.
+ *
+ * @return string
+ *   The Salesforce language code corresponding to the Drupal language code.
  */
 function salesforce_webforms_language_code($language = NULL) {
   if (!isset($language)) {
@@ -1205,6 +1280,9 @@ function salesforce_webforms_language_code($language = NULL) {
 
   if ($language == 'en') {
     $language = 'en_US';
+  }
+  elseif (preg_match ("/.{1,2}-.{1,2}/", $language)) {
+    $language = preg_replace ("/(.{1,2})-(.{1,2})/", "$1_$2", $language); 
   }
 
   return $language;
