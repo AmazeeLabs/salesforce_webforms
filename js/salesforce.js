@@ -122,6 +122,10 @@
     var formId = $div.attr('id');
     var settings = e.data.settings;
 
+    if (formId === undefined) {
+      return;
+    }
+
     for (var i = 0; i < settings[formId].children.length; i++) {
       Drupal.salesforce_webforms.show_hide(settings[formId].children[i], settings);
     }
