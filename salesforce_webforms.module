@@ -474,9 +474,14 @@ function salesforce_webforms_map_save(array $values) {
  *   - target: String identifying target value.
  *   - keyfield: Boolean indicating if this is a key field.
  *   - picklist: (optional) String to override target.
+ *   - filter: (optional) name of a filter defined by
+ *             hook_salesforce_webforms_filter_info().
  */
 function salesforce_webforms_save_fields($mapid, array $fields) {
   $i = 1;
+  $schema_version = salesforce_webforms_schema_version();
+  $include_filter = ($schema_version >= 7004);
+
   foreach ($fields as $fname => &$values) {
     // Only process if we are given source data.
     if (isset($values['picklist'])) {
@@ -491,17 +496,19 @@ function salesforce_webforms_save_fields($mapid, array $fields) {
     }
 
     if ($values['target']) {
+      $field_values = array(
+        'mapid' => $mapid,
+        'sf_fieldname' => $fname,
+        'source_data' => $values['target'],
+        'is_keyfield' => $values['keyfield'],
+        'displayorder' => $i++,
+      );
+      if ($include_filter) {
+        $field_values['filter'] = isset($values['filter']) ? $values['filter'] : NULL;
+      }
+
       db_insert('salesforce_webforms_field')
-        ->fields(
-          array(
-            'mapid' => $mapid,
-            'sf_fieldname' => $fname,
-            'source_data' => $values['target'],
-            // 'is_keyfield' => $values['keyfield'][1],
-            'is_keyfield' => $values['keyfield'],
-            'displayorder' => $i++,
-          )
-        )
+        ->fields($field_values)
         ->execute();
     }
   }
@@ -524,6 +531,20 @@ function salesforce_webforms_webform_version() {
   }
 
   return $webform_version;
+}
+
+/**
+ * Gets the current database schema version for this module.
+ */
+function salesforce_webforms_schema_version() {
+  static $version = NULL;
+
+  if ($version === NULL) {
+    module_load_include('inc', 'content', 'includes/install');
+    $version = drupal_get_installed_schema_version('salesforce_webforms');
+  }
+
+  return $version;
 }
 
 /**
@@ -575,7 +596,7 @@ function salesforce_webforms_webform_submission_insert($node, $sub, $update = FA
 
         // See if we're running on webform 3.x. If so, replace tokens.
         if ($webform_version < 4) {
-          $filtered_source = _webform_filter_values($source, $node, $sub, NULL, FALSE);
+          $filtered_source = _webform_filter_values($source, $node, $sub, NULL, FALSE, TRUE);
           if ($filtered_source != '') {
             $tokens = array(
               'node' => $node,
@@ -588,6 +609,11 @@ function salesforce_webforms_webform_submission_insert($node, $sub, $update = FA
         }
         else {
           $filtered_source = webform_replace_tokens($source, $node, $sub, NULL, FALSE);
+        }
+
+        // Do we have any filters to apply?
+        if (isset($field['filter'])) {
+          $filtered_source = salesforce_webforms_filter_invoke($field['filter'], $filtered_source);
         }
 
         if ($key) {
@@ -619,14 +645,17 @@ function salesforce_webforms_webform_submission_insert($node, $sub, $update = FA
         }
       }
 
-      // Add hook_salesforce_webforms_push_params_alter.
+      // Call hook_salesforce_webforms_submission_save_alter.
       $context = array(
         'map' => $map,
         'node' => $node,
         'submission' => $sub,
         'id' => $target_id,
       );
-      drupal_alter('salesforce_webforms_save_submission', $fields, $context);
+      drupal_alter('salesforce_webforms_submission_save', $fields, $context);
+
+      // @deprecated as of 7.x-1.1
+      drupal_alter('salesforce_webforms_push_params', $fields, $context);
 
       if ($target_id) {
         // Do an update.
@@ -773,6 +802,26 @@ function salesforce_webforms_webform_select_options_info() {
   }
 
   return $items;
+}
+
+/**
+ * Implements hook_salesforce_webforms_filter_info().
+ */
+function salesforce_webforms_salesforce_webforms_filter_info() {
+  return array(
+    'salesforce webforms date' => array(
+      'label' => t('Format as Salesforce Date'),
+      'file' => 'salesforce_webforms.filters.inc',
+      'callback' => 'salesforce_webforms_date_filter',
+      'field types' => array('date'),
+    ),
+    'salesforce webforms date time' => array(
+      'label' => t('Format as Salesforce Date/Time'),
+      'file' => 'salesforce_webforms.filters.inc',
+      'callback' => 'salesforce_webforms_datetime_filter',
+      'field types' => array('datetime'),
+    ),
+  );
 }
 
 /**
@@ -925,6 +974,93 @@ function _salesforce_webforms_fetch($url, $use_cache = TRUE, $suppress_errors = 
   cache_set($cachename, $data, 'cache_salesforce_webforms', time() + SALESFORCE_WEBFORMS_CACHE_DURATION);
 
   return $data;
+}
+
+/**
+ * Gets the list of data filters defined by this and other modules.
+ */
+function salesforce_webforms_filters() {
+  static $filters;
+
+  if (!$filters) {
+    $filters = array();
+
+    // Invoke all of the hooks to define filters.
+    foreach (module_implements('salesforce_webforms_filter_info') as $module) {
+      $module_filters = module_invoke($module, 'salesforce_webforms_filter_info');
+      foreach ($module_filters as $type => $info) {
+        // Store the module name so we can include the file if needed.
+        $module_filters[$type]['module'] = $module;
+      }
+      $filters += $module_filters;
+    }
+
+    // Invoke all implementations of hook_salesforce_webforms_filter_info_alter.
+    drupal_alter('salesforce_webforms_filter_info', $filters);
+
+    // Sort by the label.
+    uasort($filters, function($a, $b) {
+      return strnatcasecmp($a['label'], $b['label']);
+    });
+  }
+
+  return $filters;
+}
+
+/**
+ * Load a filter file into memory.
+ *
+ * @param string $filter_type
+ *   The string machine name of the filter.
+ */
+function salesforce_webforms_filter_include($filter_type) {
+  static $included = array();
+
+  // Don't load it if we've already loaded this filter.
+  if (!isset($included[$filter_type])) {
+    $filters = salesforce_webforms_filters();
+    $included[$filter_type] = TRUE;
+
+    // Is the file attribute specified?
+    if (($info = $filters[$filter_type]) && isset($info['file'])) {
+      $pathinfo = pathinfo($info['file']);
+      $basename = basename($pathinfo['basename'], '.' . $pathinfo['extension']);
+      $path = (!empty($pathinfo['dirname']) ? $pathinfo['dirname'] . '/' : '') . $basename;
+      module_load_include($pathinfo['extension'], $info['module'], $path);
+    }
+  }
+}
+
+/**
+ * Invokes a filter.
+ *
+ * @param string $filter
+ *   The machine name of the filter.
+ * @param string $value
+ *   The source value, after all tokens have been replaced.
+ *
+ * @return string|array
+ *   The filtered value, as returned by the callback function.
+ */
+function salesforce_webforms_filter_invoke($filter, $value) {
+  // Initialize the return value to be the same as the source.
+  $return = $value;
+
+  // Look up the filter.
+  $filters = salesforce_webforms_filters();
+
+  // Is there a callback specified?
+  if (isset($filters[$filter]) && isset($filters[$filter]['callback'])) {
+    $callback = $filters[$filter]['callback'];
+
+    // Make sure the function's definition has been included.
+    salesforce_webforms_filter_include($filter);
+    if (function_exists($callback)) {
+      $return = $callback($value);
+    }
+  }
+
+  return $return;
 }
 
 /**
@@ -1260,11 +1396,10 @@ function salesforce_webforms_get_picklist_options($limit = TRUE) {
 /**
  * Gets the Salesforce language code for the given Drupal language code.
  *
- * 1) In most instances, these two values are the same. However, for English,
- *    Drupal uses 'en' while Salesforce expects 'en_US'.
- *
- * 2) RFC 4646 states that country and language code should be seperated by a
- *    dash "-" while underscore Salesforce expects a "_". 
+ * In most instances, these two values are the same. However, for English,
+ * Drupal uses 'en' while Salesforce expects 'en_US'. Also, when the country
+ * is included in the language code, Drupal follows RFC 4646, where the string
+ * is of the form ll-CC, while Salesforce expects ll_CC.
  *
  * @param string $language
  *   The language to query. If not specified, the language of the current
@@ -1284,6 +1419,9 @@ function salesforce_webforms_language_code($language = NULL) {
   elseif (preg_match ("/.{1,2}-.{1,2}/", $language)) {
     $language = preg_replace ("/(.{1,2})-(.{1,2})/", "$1_$2", $language); 
   }
+
+  // Map dashes (-) (RFC 4646)  to underscore (_) (Salesforce standard).
+  $language = str_replace("-", "_", $language);
 
   return $language;
 }
